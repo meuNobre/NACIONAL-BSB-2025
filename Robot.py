@@ -2,6 +2,8 @@ from hub import motion_sensor, port, button
 import motor
 import runloop, motor_pair, time, color_sensor, color
 from app import linegraph
+from motor import *
+from math import radians, degrees, sqrt, atan2, cos, sin
 
 # Definição de constantes que representam comandos de movimento
 subir = 'subir'
@@ -19,7 +21,7 @@ class Controle_PID:
 
     # Obtém o ângulo atual da guinada(yaw) do robô
     async def _get_current_yaw(self):
-        return motion_sensor.tilt_angles()[0]
+        return (motion_sensor.tilt_angles()[0] * -0.1)
 
     # Calcula o erro atual com base no ângulo alvo
     async def _compute_error(self, target):
@@ -52,9 +54,32 @@ class Controle_PID:
         
         return int(left_speed), int(right_speed)
 
+class PathPlanner:
+    def __init__(self):
+        self.waypoints = []# Lista de waypoints
+
+    def add_waypoint(self, x, y, heading):
+        self.waypoints.append((x, y, heading))
+
+    def generate_trajectory(self, start, end, num_points=10):
+        waypoints = []
+        for i in range(num_points + 1):
+            x = start[0] + (end[0] - start[0]) * (i / num_points)
+            y = start[1] + (end[1] - start[1]) * (i / num_points)
+            heading = start[2]# Manter o mesmo heading para simplicidade
+            waypoints.append((x, y, heading))
+        return waypoints
+
+    async def follow_trajectory(self, robot, trajectory):
+        for waypoint in trajectory:
+            target_x, target_y, target_heading = waypoint
+            await robot.navigate_to(target_x, target_y, target_heading)
+            
+
 # Classe principal do robô que controla movimentos e sensores
-class Robot:
+class Robot(PathPlanner):
     def __init__(self,control_pid):
+        super().__init__()
         self.velocidade = self.velocidade
         self.velocidadeDosAnexos = self.velocidadeDosAnexos
         self.controle_pid = control_pid
@@ -74,6 +99,65 @@ class Robot:
     # Reseta o ângulo de guinada para 0
     async def Manutencao_Guinada(self):
         motion_sensor.reset_yaw(0)
+
+    async def navigate_to(self, target_x, target_y):
+        while True:
+            # Atualiza a pose atual do robô
+            await self.update_pose()
+            distance = sqrt((target_x - self.current_pose[0]) ** 2 + (target_y - self.current_pose[1]) ** 2)
+            angle_to_target = degrees(atan2(target_y - self.current_pose[1], target_x - self.current_pose[0]))
+
+            # Calcula a diferença de ângulo
+            angle_diff = angle_to_target - self.current_pose[2]
+            if angle_diff > 180:
+                angle_diff -= 360
+            elif angle_diff < -180:
+                angle_diff += 360
+
+            # Se o robô estiver próximo o suficiente do waypoint, pare
+            if distance < 1.0:# Tolerância de 1 cm
+                break
+
+            # Ajusta a velocidade e direção
+            if abs(angle_diff) > 5:# Se a diferença de ângulo for maior que 5 graus
+                # Gira para o ângulo desejado
+                if angle_diff > 0:
+                    motor_pair.move_tank(motor_pair.PAIR_1,100, -100)# Gira à direita
+                else:
+                    motor_pair.move_tank(motor_pair.PAIR_1,-100, 100)# Gira à esquerda
+            else:
+                # Move para frente
+                motor_pair.move_tank(motor_pair.PAIR_1,100, 100)
+
+            time.sleep(0.1)# Espera um pouco antes de atualizar novamente
+
+        # Para os motores ao alcançar o waypoint
+        motor_pair.stop(motor_pair.PAIR_1, stop=BRAKE)
+
+    async def update_pose(self):
+        # Obtém a posição relativa dos motores
+        left_distance = motor.relative_position(port.A)# Distância percorrida pela roda esquerda
+        right_distance = motor.relative_position(port.B)# Distância percorrida pela roda direita
+
+        # Calcula a distância média percorrida
+        average_distance = (left_distance + right_distance) / 2.0
+
+        # Lê a orientação atual do giroscópio
+        current_heading = (motion_sensor.tilt_angles()[0] * -0.1)# Obtém o ângulo de guinada
+
+        # Atualiza a posição do robô
+        heading_radians = radians(current_heading)
+
+        # Atualiza a posição (x, y) com base na distância média e na orientação
+        self.current_pose = (
+            self.current_pose[0] + average_distance * cos(heading_radians),
+            self.current_pose[1] + average_distance * sin(heading_radians),
+            current_heading
+        )
+
+        # Reseta a posição relativa dos motores após a atualização da pose
+        motor.reset_relative_position(port.A, 0)# Reseta a posição do motor esquerdo
+        motor.reset_relative_position(port.B, 0)# Reseta a posição do motor direito
 
     # Função genérica para mover o robô com aceleração e desaceleração suave
     async def _movimento(self, pair, duration_s, power = 400):
@@ -137,9 +221,9 @@ class Robot:
     async def Girar(self, angulo, velocidade = 20):
         await self.Manutencao_Guinada()
 
-        while round((motion_sensor.tilt_angles()[0] / 10)) != angulo:
+        while round((motion_sensor.tilt_angles()[0] * -0.1)) != angulo:
 
-            print("Angulo Atual {}" .format(round(motion_sensor.tilt_angles()[0] / 10))) #Printar Angulo(Guinada) Atual.
+            print("Angulo Atual {}" .format(round(motion_sensor.tilt_angles()[0] * -0.1))) #Printar Angulo(Guinada) Atual.
  
             motor_pair.move_tank(motor_pair.PAIR_1, (((velocidade * 10) * (angulo)) / (angulo)), (((-velocidade * 10) * (angulo)) / (angulo) ))
 
@@ -157,7 +241,7 @@ class Robot:
         # A velocidade é definida pela variável `self.velocidadeDosAnexos` multiplicada pelo multiplicador, 
         # que garante a direção correta.
         await motor.run_for_time(port1, duracao, self.velocidadeDosAnexos * multiplicador(direcao))
-
+        motor.stop(port.A, stop=HOLD)
     # Função para o Robot parar de Mover
     async def Parar_de_Mover(self):
         motor_pair.stop(motor_pair.PAIR_1)
@@ -178,6 +262,73 @@ class Robot:
     # Função para limpar todos os Graficos de Linha
     async def LimparLineGraphic(self):
         linegraph.clear_all()
+
+    async def VirarRobo(self, rumo_desejado:int, velocidade_minima: int, velocidade_maxima :int, raio_de_virada:int):
+        """
+        Faz o robô girar até atingir um rumo (ângulo) específico usando controle proporcional e rampagem de velocidade.
+
+        Parâmetros:
+        - rumo_desejado(int): Ângulo de destino em graus. Valores positivos indicam sentido horário e negativos, anti-horário.
+        - velocidade_minima (int): Velocidade inicial mínima para iniciar a manobra.
+        - velocidade_maxima (int): Velocidade máxima permitida durante a virada.
+        - raio_de_virada (int): Raio da curva em milímetros. Define quão fechada será a curva.
+        """
+
+        # Obtém o ângulo atual do robô usando o giroscópio (Guinada/Yaw).
+        rumo_atual = (motion_sensor.tilt_angles()[0] * -0.1)
+
+        # Calcula o erro, que é a diferença entre o rumo desejado e o rumo atual.
+        erro_de_rumo = rumo_desejado - rumo_atual
+
+        # Determina a direção da virada. Se o erro for positivo, gira no sentido horário (+1);
+        # se for negativo, gira no sentido anti-horário (-1).
+        direcao = 1 if erro_de_rumo >= 0 else -1
+
+        # Ganho proporcional que ajusta a resposta com base no erro.
+        # Quanto maior o ganho, mais rápido o ajuste.
+        ganho_proporcional = 0.6
+
+        # Taxa de rampa usada para aumentar a velocidade gradualmente.
+        taxa_de_rampa = 0.05
+
+        # Define a velocidade inicial como a velocidade mínima.
+        velocidade_atual = velocidade_minima
+
+        # Distância entre as rodas do robô (em mm).
+        # Este valor influencia o cálculo das velocidades das rodas.
+        distancia_rodas = 120 # Ajustar conforme o design  robô.
+
+        # Continua ajustando a direção até que o erro esteja dentro de 1 grau (tolerância).
+        while abs(erro_de_rumo) > 1:
+            # Atualiza o rumo atual e recalcula o erro.
+            rumo_atual = (motion_sensor.tilt_angles()[0] * -0.1)
+            erro_de_rumo = rumo_desejado - rumo_atual
+
+            # Se o rumo desejado foi ultrapassado (ou alcançado), interrompe o loop.
+            if (direcao > 0 and rumo_atual >= rumo_desejado) or (direcao < 0 and rumo_atual <= rumo_desejado):
+                break
+
+            # Calcula a velocidade proporcional ao erro, limitada pela velocidade máxima.
+            velocidade_proporcional = min(max(ganho_proporcional * abs(erro_de_rumo), velocidade_minima), velocidade_maxima)
+
+            # Aumenta a velocidade atual gradualmente, respeitando o limite da velocidade proporcional.
+            velocidade_atual = min(velocidade_atual + taxa_de_rampa, velocidade_proporcional)
+
+            # Cálculo da velocidade das rodas:
+            # A roda interna se move mais devagar para realizar a curva, enquanto a externa se move mais rápido.
+            velocidade_roda_interna = direcao * velocidade_atual * (1 - raio_de_virada / (raio_de_virada + distancia_rodas / 2))
+            velocidade_roda_externa = direcao * velocidade_atual * (1 + raio_de_virada / (raio_de_virada + distancia_rodas / 2))
+
+            # Envia os comandos de movimento
+            motor_pair.move_tank(parFrente, int(velocidade_roda_interna), int(velocidade_roda_externa))
+
+            # Pequena pausa para evitar que o loop rode muito rápido 
+            await time.sleep(0.1)
+
+        # Após atingir o rumo desejado, para os motores para evitar movimentos extras.
+        motor_pair.stop(parFrente)
+
+
 
 # Classe para Organizar Lancamentos (Em desenvolvimento)
 class Lancamentos:
@@ -205,6 +356,10 @@ async def main():
     await spike.mover_forward(duration_s = 3, power = 600)
     await spike.mover_backward(duration_s = 3, power = 600)
     await spike.Girar(angulo =  90)
+
+    # Adiciona waypoints para a trajetória
+    trajectory = spike.generate_trajectory((0, 0, 0), (10, 10, 0), num_points=10)
+    await spike.follow_trajectory(spike, trajectory)
 
 #Função Secundária para armazenar toda a Logica de Sensor de Cor (Metodo dos Aneis)
 async def ButtonColor():
